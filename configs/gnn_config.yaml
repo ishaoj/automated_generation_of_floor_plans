@@ -1,0 +1,68 @@
+# GNN Layout Refiner Training Configuration
+
+# Data
+data:
+  data_dir: "data/cubicasa5k"
+  batch_size: 8
+  num_workers: 0  # Set to 0 for debugging, increase for faster loading
+  min_rooms: 2
+  max_rooms: 10
+  filter_non_residential: true
+
+# Model Architecture
+model:
+  node_features_dim: 21  # 11 room types + 1 area + 9 zones
+  edge_features_dim: 4   # distance, dx, dy, adjacency
+  hidden_dim: 128
+  num_gat_layers: 3
+  num_heads: 4
+  dropout: 0.1
+
+# Training
+training:
+  num_epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: "auto"  # 'cpu', 'cuda', or 'auto'
+
+  # Early stopping
+  patience: 10
+  min_delta: 0.0001
+
+# Loss weights
+loss:
+  position_weight: 1.0
+  overlap_weight: 5.0
+  area_weight: 0.5
+  adjacency_weight: 0.3
+  use_vastu_loss: false  # Set to true to include Vastu compliance in loss
+  vastu_weight: 0.5
+
+# Data Augmentation
+augmentation:
+  enable: true
+  flip_prob: 0.5
+  rotate_prob: 0.5
+  jitter_prob: 0.3
+  jitter_std: 0.02
+  size_var_prob: 0.3
+  size_var_range: 0.05
+
+# Checkpointing
+checkpoint:
+  save_dir: "ml/models/saved"
+  keep_n_best: 3
+  save_every_n_epochs: 10
+
+# Logging
+logging:
+  use_wandb: false  # Set to true to use Weights & Biases
+  wandb_project: "vastu-ai-gnn"
+  use_tensorboard: true
+  tensorboard_dir: "runs/gnn_refiner"
+  log_every_n_steps: 50
+
+# Inference
+inference:
+  max_adjustment: 0.15  # Max 15% position adjustment
+  min_room_size: 0.05   # Min 5% room size

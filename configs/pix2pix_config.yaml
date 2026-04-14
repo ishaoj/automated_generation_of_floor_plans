@@ -1,0 +1,54 @@
+# Pix2Pix Visual Renderer Training Configuration
+# Complete configuration for training the floor plan rendering model
+
+# Run name
+run_name: "pix2pix_floor_plan_renderer"
+
+# Data Configuration
+data_dir: "data/cubicasa5k"
+batch_size: 4  # Adjust based on GPU memory (4 for 8GB, 8 for 16GB, 16 for 24GB+)
+num_workers: 4  # Number of data loading workers
+
+# Model Configuration
+use_multiscale: false  # Use multi-scale discriminator (slower but better quality)
+lambda_l1: 100.0  # Weight for L1 reconstruction loss (higher = more faithful to input)
+
+# Training Configuration
+epochs: 100  # Number of training epochs
+learning_rate: 0.0002  # Initial learning rate (standard for Pix2Pix)
+lr_decay_epochs: 50  # Decay learning rate every N epochs
+lr_decay_gamma: 0.5  # Multiply learning rate by this factor at decay
+
+# Checkpointing
+output_dir: "ml/models/saved/pix2pix"
+save_frequency: 10  # Save checkpoint every N epochs
+sample_frequency: 5  # Generate sample images every N epochs
+metric_frequency: 5  # Compute expensive metrics (FID, LPIPS) every N epochs
+
+# Logging
+use_wandb: false  # Enable Weights & Biases logging
+wandb_project: "vastu-ai-pix2pix"
+log_frequency: 10  # Log training metrics every N batches
+
+# Data Augmentation (optional)
+augmentation:
+  horizontal_flip: true
+  vertical_flip: false
+  rotation: false
+  color_jitter: false
+
+# Image Settings
+image_size: 256  # Input/output image size (256x256 is standard)
+
+# Hardware Settings
+device: "auto"  # auto, cpu, cuda, mps
+mixed_precision: false  # Use mixed precision training (faster on modern GPUs)
+
+# Validation
+val_split: 0.1  # Fraction of data to use for validation
+
+# Early Stopping
+early_stopping:
+  enabled: false
+  patience: 10  # Stop if validation loss doesn't improve for N epochs
+  min_delta: 0.001  # Minimum change to qualify as improvement

@@ -1,0 +1,26 @@
+# FastAPI and server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Data validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Constraint solver
+ortools>=9.12.4544
+
+# Graph operations
+networkx>=3.2.0
+
+# Image processing and rendering
+pillow>=10.0.0
+numpy>=1.26.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+httpx>=0.26.0
