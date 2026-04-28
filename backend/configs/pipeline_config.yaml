@@ -1,0 +1,12 @@
+# End-to-end ML inference pipeline configuration
+
+gnn:
+  model_path: "ml/models/saved/gnn_v1/best_model.pt"
+
+pix2pix:
+  model_path: "ml/models/saved/pix2pix_v1/best_model.pt"
+  ngf: 32
+
+inference:
+  device: "auto"
+  semantic_image_size: 256

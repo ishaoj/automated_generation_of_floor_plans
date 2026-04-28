@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.api.routes import generate, health
+from app.api.routes import generate, health, preview
 
 
 def create_app() -> FastAPI:
@@ -35,6 +35,11 @@ def create_app() -> FastAPI:
         generate.router,
         prefix=settings.api_prefix,
         tags=["Generation"]
+    )
+    app.include_router(
+        preview.router,
+        prefix=settings.api_prefix,
+        tags=["Preview"]
     )
 
     return app

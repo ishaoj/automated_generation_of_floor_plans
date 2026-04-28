@@ -81,43 +81,53 @@ class UNetGenerator(nn.Module):
             1x1 → 2x2 → 4x4 → 8x8 → 16x16 → 32x32 → 64x64 → 128x128 → 256x256
     """
 
-    def __init__(self, in_channels: int = 3, out_channels: int = 3):
+    def __init__(self, in_channels: int = 3, out_channels: int = 3, ngf: int = 64):
         super().__init__()
+
+        # Channel sizes at each depth (scaled by ngf/64)
+        c1  = ngf               # 64 → e.g. 32
+        c2  = ngf * 2           # 128
+        c3  = ngf * 4           # 256
+        c4  = min(ngf * 8, 512) # 512 (cap at 512)
+        c5  = c4
+        c6  = c4
+        c7  = c4
+        cbn = c4                # bottleneck
 
         # Encoder (Downsampling path)
         # No batch norm on first layer
         self.down1 = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(in_channels, c1, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2)
         )
 
-        self.down2 = UNetBlock(64, 128, down=True)         # 128x128 → 64x64
-        self.down3 = UNetBlock(128, 256, down=True)        # 64x64 → 32x32
-        self.down4 = UNetBlock(256, 512, down=True)        # 32x32 → 16x16
-        self.down5 = UNetBlock(512, 512, down=True)        # 16x16 → 8x8
-        self.down6 = UNetBlock(512, 512, down=True)        # 8x8 → 4x4
-        self.down7 = UNetBlock(512, 512, down=True)        # 4x4 → 2x2
+        self.down2 = UNetBlock(c1, c2, down=True)   # 128x128 → 64x64
+        self.down3 = UNetBlock(c2, c3, down=True)   # 64x64 → 32x32
+        self.down4 = UNetBlock(c3, c4, down=True)   # 32x32 → 16x16
+        self.down5 = UNetBlock(c4, c5, down=True)   # 16x16 → 8x8
+        self.down6 = UNetBlock(c5, c6, down=True)   # 8x8 → 4x4
+        self.down7 = UNetBlock(c6, c7, down=True)   # 4x4 → 2x2
 
         # Bottleneck
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1),  # 2x2 → 1x1
+            nn.Conv2d(c7, cbn, kernel_size=4, stride=2, padding=1),  # 2x2 → 1x1
             nn.ReLU()
         )
 
         # Decoder (Upsampling path with skip connections)
         # Dropout on first 3 layers for regularization
-        self.up1 = UNetBlock(512, 512, down=False, use_dropout=True)      # 1x1 → 2x2
-        self.up2 = UNetBlock(1024, 512, down=False, use_dropout=True)     # 2x2 → 4x4 (1024 = 512 + 512 skip)
-        self.up3 = UNetBlock(1024, 512, down=False, use_dropout=True)     # 4x4 → 8x8
-        self.up4 = UNetBlock(1024, 512, down=False)                       # 8x8 → 16x16
-        self.up5 = UNetBlock(1024, 256, down=False)                       # 16x16 → 32x32
-        self.up6 = UNetBlock(512, 128, down=False)                        # 32x32 → 64x64
-        self.up7 = UNetBlock(256, 64, down=False)                         # 64x64 → 128x128
+        self.up1 = UNetBlock(cbn,      c7, down=False, use_dropout=True)   # 1x1 → 2x2
+        self.up2 = UNetBlock(c7*2,     c6, down=False, use_dropout=True)   # 2x2 → 4x4
+        self.up3 = UNetBlock(c6*2,     c5, down=False, use_dropout=True)   # 4x4 → 8x8
+        self.up4 = UNetBlock(c5*2,     c4, down=False)                     # 8x8 → 16x16
+        self.up5 = UNetBlock(c4*2,     c3, down=False)                     # 16x16 → 32x32
+        self.up6 = UNetBlock(c3+c3,    c2, down=False)                     # 32x32 → 64x64
+        self.up7 = UNetBlock(c2+c2,    c1, down=False)                     # 64x64 → 128x128
 
         # Final layer: 128x128 → 256x256, no batch norm
         self.final = nn.Sequential(
-            nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1),
-            nn.Tanh()  # Output in range [-1, 1]
+            nn.ConvTranspose2d(c1+c1, out_channels, kernel_size=4, stride=2, padding=1),
+            nn.Tanh()
         )
 
     def forward(self, x):

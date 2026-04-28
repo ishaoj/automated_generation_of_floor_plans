@@ -51,7 +51,8 @@ class Pix2PixModel(nn.Module):
         in_channels: int = 3,
         out_channels: int = 3,
         use_multiscale: bool = False,
-        lambda_l1: float = 100.0
+        lambda_l1: float = 100.0,
+        ngf: int = 64,
     ):
         """
         Args:
@@ -67,7 +68,8 @@ class Pix2PixModel(nn.Module):
         # Generator: semantic map → realistic rendering
         self.generator = UNetGenerator(
             in_channels=in_channels,
-            out_channels=out_channels
+            out_channels=out_channels,
+            ngf=ngf,
         )
 
         # Discriminator: classify real vs fake
