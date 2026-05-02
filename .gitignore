@@ -1,0 +1,71 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+backend/venv/
+
+# ── Environment variables ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+*.env
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+.npm
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+runs/
+
+# ── Training artifacts (large — keep out of git) ──────────────────────────────
+# Trained model checkpoints are committed ONLY for the final production model.
+# Remove the lines below if you want to track all checkpoints.
+backend/models/saved/*/checkpoint_epoch_*.pt
+ml/models/saved/*/checkpoint_epoch_*.pt
+
+# ── Dataset (5.7 GB — never commit) ──────────────────────────────────────────
+data/cubicasa5k_extracted/
+data/*.zip
+data/*.tar.gz
+
+# ── Build cache ───────────────────────────────────────────────────────────────
+.cache/
+*.tsbuildinfo
+frontend/tsconfig.tsbuildinfo
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/
+
+# ── Test outputs ─────────────────────────────────────────────────────────────
+*.png
+!frontend/public/**/*.png
+htmlcov/
+.coverage

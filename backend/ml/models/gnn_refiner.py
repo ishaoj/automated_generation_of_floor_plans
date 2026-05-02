@@ -38,7 +38,7 @@ class GraphAttentionRefiner(nn.Module):
 
     def __init__(
         self,
-        node_features_dim: int = 21,  # 11 room types + 1 area + 9 zones
+        node_features_dim: int = 16,  # 11 room types + 1 area + 4 normalised (x,y,w,h)
         edge_features_dim: int = 4,   # distance, dx, dy, adjacency
         hidden_dim: int = 128,
         num_gat_layers: int = 3,
@@ -108,8 +108,9 @@ class GraphAttentionRefiner(nn.Module):
             nn.Tanh(),  # Bounded adjustments in [-1, 1]
         )
 
-        # Scale for adjustments (how much to allow refinement)
-        self.adjustment_scale = 0.1  # Max 10% adjustment
+        # Max adjustment per room: ~20% of normalized plot dimension.
+        # Covers ~2.5σ of the training noise (pos_std=0.08, size_std=0.04).
+        self.adjustment_scale = 0.20
 
     def forward(
         self,

@@ -1,12 +1,7 @@
-# End-to-end ML inference pipeline configuration
-
 gnn:
-  model_path: "ml/models/saved/gnn_v1/best_model.pt"
-
-pix2pix:
-  model_path: "ml/models/saved/pix2pix_v1/best_model.pt"
-  ngf: 32
+  # Path is resolved relative to the project root (vastu-ai/).
+  # Override with GNN_MODEL_PATH environment variable on any server.
+  model_path: "ml/models/saved/gnn_v3/best_model.pt"
 
 inference:
-  device: "auto"
-  semantic_image_size: 256
+  device: "auto"   # auto selects: cuda > mps > cpu

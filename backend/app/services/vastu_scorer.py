@@ -10,6 +10,7 @@ from app.core.vastu_rules import (
     ZONE_SCORE_MATRIX,
     ENTRANCE_RULES,
     BRAHMASTHAN_RULES,
+    PRIVACY_ZONES,
     RULE_WEIGHTS,
 )
 from app.core.constants import ZONES, Direction
@@ -38,28 +39,24 @@ class VastuScorer:
         """
         facing = layout.facing_direction
 
-        # Calculate individual scores
         room_placement_score = self._score_room_placement(layout.rooms, facing)
-        entrance_score = self._score_entrance(layout, facing)
-        center_score = self._score_center(layout)
-        proportion_score = self._score_proportions(layout.rooms)
+        entrance_score       = self._score_entrance(layout, facing)
+        center_score         = self._score_center(layout)
+        proportion_score     = self._score_proportions(layout.rooms)
+        privacy_score        = self._score_privacy_gradient(layout)
 
-        # Weighted total
+        # Weighted total (room placement 35%, entrance 20%, center 20%,
+        # privacy gradient 15%, proportions 10%)
         total = int(
-            room_placement_score * RULE_WEIGHTS["room_placement"] +
-            entrance_score * RULE_WEIGHTS["entrance"] +
-            center_score * RULE_WEIGHTS["center_clear"] +
-            proportion_score * RULE_WEIGHTS["proportions"]
-        ) * 100 // (
-            RULE_WEIGHTS["room_placement"] +
-            RULE_WEIGHTS["entrance"] +
-            RULE_WEIGHTS["center_clear"] +
-            RULE_WEIGHTS["proportions"]
+            room_placement_score * 0.35
+            + entrance_score       * 0.20
+            + center_score         * 0.20
+            + privacy_score        * 0.15
+            + proportion_score     * 0.10
         )
 
-        # Generate improvement suggestions
         suggestions = self._generate_suggestions(
-            layout, room_placement_score, entrance_score, center_score
+            layout, room_placement_score, entrance_score, center_score, privacy_score
         )
 
         return VastuScore(
@@ -192,6 +189,76 @@ class VastuScorer:
 
         return int(mean(scores)) if scores else 70
 
+    def _score_privacy_gradient(self, layout: Layout) -> int:
+        """
+        Score how well the layout follows the Public → Semi-public → Private gradient.
+
+        A well-designed house layers rooms from the entrance inward:
+          Public (0–35%): parking, entrance, foyer
+          Semi-public (20–70%): living room, dining, kitchen
+          Private (50–100%): bedrooms, bathrooms, puja room
+
+        Scoring:
+          Each room that lands in its correct depth band scores 100.
+          Each room that is in the wrong band scores 0 (or 50 for adjacent bands).
+
+        "Depth" is measured as distance from the entrance wall, normalised 0–1.
+        Facing north → depth = y / plot_length (y=0 is the entrance side)
+        Facing south → depth = (pl - y - h) / pl  (y=pl is entrance side)
+        Facing east  → depth = (pw - x - w) / pw
+        Facing west  → depth = x / pw
+        """
+        if not layout.rooms:
+            return 50
+
+        pl = layout.plot_length
+        pw = layout.plot_width
+        facing = layout.facing_direction
+
+        def depth(room: Room) -> float:
+            cx = room.x + room.width  / 2
+            cy = room.y + room.height / 2
+            if facing == "north":
+                return cy / pl
+            elif facing == "south":
+                return (pl - cy) / pl
+            elif facing == "east":
+                return (pw - cx) / pw
+            else:  # west
+                return cx / pw
+
+        scores: list[int] = []
+        for room in layout.rooms:
+            rt = room.room_type.lower()
+            d  = depth(room)
+
+            # Determine which privacy zone this room belongs to
+            if any(t in rt for t in PRIVACY_ZONES["public"]["room_types"]):
+                lo, hi = PRIVACY_ZONES["public"]["depth_from_entrance"]
+                # Slightly generous tolerance
+                if lo <= d <= hi + 0.15:
+                    scores.append(100)
+                else:
+                    scores.append(max(0, int(100 - abs(d - hi) * 200)))
+
+            elif any(t in rt for t in PRIVACY_ZONES["semi_public"]["room_types"]):
+                lo, hi = PRIVACY_ZONES["semi_public"]["depth_from_entrance"]
+                if lo <= d <= hi:
+                    scores.append(100)
+                else:
+                    scores.append(max(0, int(100 - min(abs(d - lo), abs(d - hi)) * 150)))
+
+            elif any(t in rt for t in PRIVACY_ZONES["private"]["room_types"]):
+                lo, hi = PRIVACY_ZONES["private"]["depth_from_entrance"]
+                if lo <= d <= hi:
+                    scores.append(100)
+                else:
+                    scores.append(max(0, int(100 - abs(d - lo) * 200)))
+
+            # Rooms with no privacy zone classification (balcony, staircase, ots, store)
+            # are neutral — don't penalise them
+        return int(mean(scores)) if scores else 70
+
     def _get_zone_from_position(self, x: float, y: float, plot_width: float, plot_length: float) -> str:
         """Determine Vastu zone from position"""
         nx = x / plot_width if plot_width > 0 else 0.5
@@ -228,33 +295,115 @@ class VastuScorer:
         layout: Layout,
         room_score: int,
         entrance_score: int,
-        center_score: int
+        center_score: int,
+        privacy_score: int = 70,
     ) -> list[str]:
-        """Generate improvement suggestions based on scores"""
-        suggestions = []
+        """
+        Generate specific, prioritised Vastu improvement suggestions.
 
-        if room_score < 60:
-            # Find poorly placed rooms
-            for room in layout.rooms:
-                preferred = get_preferred_zones(room.room_type, layout.facing_direction)
-                if preferred and room.zone not in preferred:
-                    room_name = room.room_type.replace("_", " ").title()
-                    suggestions.append(
-                        f"Consider moving {room_name} to {'/'.join(preferred[:2]).upper()} zone"
-                    )
+        Checks are ordered by severity — the most critical Vastu violations
+        (NE kitchen, NE bathroom, etc.) appear first.
+        """
+        suggestions: list[str] = []
+        facing = layout.facing_direction
 
-        if entrance_score < 70:
-            rules = ENTRANCE_RULES.get(layout.facing_direction, {})
-            ideal = rules.get("ideal_zones", [])
-            if ideal:
+        # ── Critical zone violations ──────────────────────────────────────────
+        for room in layout.rooms:
+            rt   = room.room_type
+            zone = room.zone
+            name = rt.replace("_", " ").title()
+
+            # Kitchen in NE — most severe violation
+            if "kitchen" in rt and zone in {"northeast"}:
                 suggestions.append(
-                    f"Main entrance would be better positioned in {ideal[0].upper()} zone"
+                    f"Critical: Kitchen is in NE (Water/Purity zone) — fire element "
+                    f"in the purity zone is the most severe Vastu violation. "
+                    f"Move kitchen to SE (ideal) or NW."
                 )
 
+            # Kitchen in SW
+            elif "kitchen" in rt and zone == "southwest":
+                suggestions.append(
+                    f"Kitchen is in SW (Earth zone) — reserved for master bedroom stability. "
+                    f"Relocate to SE (Agni/Fire zone) for cooking alignment."
+                )
+
+            # Master bedroom in NE
+            elif rt == "master_bedroom" and zone == "northeast":
+                suggestions.append(
+                    f"Master bedroom in NE disrupts sleep — the water element and magnetic "
+                    f"field alignment cause restlessness. Move to SW for grounding stability."
+                )
+
+            # Master bedroom in SE
+            elif rt == "master_bedroom" and zone == "southeast":
+                suggestions.append(
+                    f"Master bedroom in SE (Fire zone) creates heat and restlessness. "
+                    f"Move to SW (Earth/Stability) for calm, restorative sleep."
+                )
+
+            # Bathroom in NE — contaminates purity zone
+            elif "bathroom" in rt and zone == "northeast":
+                suggestions.append(
+                    f"Bathroom in NE (Purity zone) is a critical Vastu violation — it "
+                    f"contaminates the highest-purity zone. Relocate to NW or W."
+                )
+
+            # Bathroom in SW
+            elif "bathroom" in rt and zone in {"southwest", "center"}:
+                suggestions.append(
+                    f"Bathroom in {zone.upper()} is forbidden — this zone must remain "
+                    f"pure (Brahmasthan) or stable (SW for master bedroom). Move to NW/W."
+                )
+
+            # Puja room not in NE
+            elif rt == "puja_room" and zone != "northeast":
+                preferred = get_preferred_zones(rt, facing)
+                suggestions.append(
+                    f"Puja room in {zone.upper()} — the prayer room must exclusively occupy "
+                    f"the NE (Ishan corner), the highest-purity zone in Vastu."
+                )
+
+        # ── Entrance placement ────────────────────────────────────────────────
+        if entrance_score < 70:
+            rules = ENTRANCE_RULES.get(facing, {})
+            ideal = rules.get("ideal_zones", [])
+            reason = rules.get("reason", "")
+            if ideal:
+                suggestions.append(
+                    f"Entrance: best positioned in {' or '.join(z.upper() for z in ideal)} zone. "
+                    f"{reason}"
+                )
+
+        # ── Centre / Brahmasthan ──────────────────────────────────────────────
         if center_score < 70:
             suggestions.append(
-                "Try to keep the center (Brahmasthan) more open for better energy flow"
+                "Brahmasthan (center) is partially blocked — this is the Space element "
+                "core of the house. Keep it completely open or place only an OTS "
+                "(Open to Sky) courtyard here for energy flow and natural ventilation."
             )
 
-        # Limit suggestions
+        # ── General misplaced rooms (lower priority) ──────────────────────────
+        if room_score < 60 and len(suggestions) < 4:
+            for room in layout.rooms:
+                preferred = get_preferred_zones(room.room_type, facing)
+                avoided   = get_avoided_zones(room.room_type)
+                zone      = room.zone
+                name      = room.room_type.replace("_", " ").title()
+                if preferred and zone not in preferred and zone not in avoided:
+                    suggestions.append(
+                        f"{name} is in {zone.upper()} zone — preferred: "
+                        f"{' or '.join(z.upper() for z in preferred[:2])}."
+                    )
+                    if len(suggestions) >= 4:
+                        break
+
+        # ── Privacy gradient ─────────────────────────────────────────────────
+        if privacy_score < 60:
+            suggestions.append(
+                "Layout does not follow the Public → Semi-public → Private gradient. "
+                "Public rooms (parking, entrance) should be near the entrance wall; "
+                "private rooms (bedrooms, bathrooms) should be deepest in the plan."
+            )
+
         return suggestions[:5]

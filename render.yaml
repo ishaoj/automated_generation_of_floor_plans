@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: vastu-ai-backend
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: ML_DEVICE
+        value: "cpu"
+      - key: DEBUG
+        value: "false"
+      - key: CORS_ORIGINS
+        value: "https://your-site.netlify.app,http://localhost:3000"

@@ -8,83 +8,99 @@ from app.models.schemas import Layout, Door, Window, Room
 
 class OpeningsPlacer:
     """
-    Places doors and windows in a floor plan layout
+    Places doors and windows in a floor plan layout.
 
-    Door placement rules:
-    - Main entrance on the facing wall
-    - Interior doors between adjacent rooms
-    - Door width: 3 feet standard
+    External door rules:
+    - Main entrance on the facing boundary wall (living room > parking > other).
+    - Parking gets its own external vehicle entrance if it touches any open wall
+      and its main entrance has not already been served by the main entrance door.
+    - No room may receive more than MAX_DOORS_PER_ROOM external doors.
+    - Doors are only placed where functionally necessary; redundant or duplicate
+      openings are skipped.
 
     Window placement rules (Vastu):
-    - Prefer windows on North and East walls (morning sunlight)
-    - Avoid windows on South and West (afternoon heat)
-    - Each room should have at least one window if on exterior
-    - Window width: 4 feet standard
+    - Prefer windows on North and East walls (morning sunlight).
+    - Avoid windows on South and West (afternoon heat).
+    - Each major room should have at least one window if on an open exterior wall.
+    - Window width: 4 feet standard.
     """
 
+    # Maximum number of external doors any single room may receive.
+    MAX_DOORS_PER_ROOM  = 2
+
+    # Standard door widths (feet)
+    door_width           = 3.0    # pedestrian entrance
+    _PARKING_DOOR_WIDTH  = 9.0    # vehicle entrance (single-car bay)
+    window_width         = 4.0
+    min_wall_clearance   = 1.0    # minimum clearance from wall corners
+
     def __init__(self):
-        self.door_width = 3.0
-        self.window_width = 4.0
-        self.min_wall_clearance = 1.0  # Minimum distance from corners
+        pass  # all widths are class-level constants
 
     def place_openings(self, layout: Layout) -> Layout:
         """
-        Add doors and windows to the layout
+        Add external entrance openings and windows to the layout.
 
-        Args:
-            layout: Floor plan layout with rooms
-
-        Returns:
-            Updated layout with doors and windows
+        Door placement order:
+          1. Main pedestrian entrance (living room / entrance zone).
+          2. Parking vehicle entrance (independent external opening, if applicable).
+        Interior doors are intentionally omitted — only boundary openings are shown.
         """
-        doors = []
-        windows = []
+        doors: list[Door] = []
+        # Tracks how many external doors have been assigned to each room (by id).
+        door_count_per_room: dict[str, int] = {}
 
-        # Place main entrance
         main_door = self._place_main_entrance(layout)
         if main_door:
             doors.append(main_door)
+            for rid in main_door.connects:
+                door_count_per_room[rid] = door_count_per_room.get(rid, 0) + 1
 
-        # Place interior doors between adjacent rooms
-        interior_doors = self._place_interior_doors(layout)
-        doors.extend(interior_doors)
+        parking_door = self._place_parking_entrance(layout, doors, door_count_per_room)
+        if parking_door:
+            doors.append(parking_door)
+            for rid in parking_door.connects:
+                door_count_per_room[rid] = door_count_per_room.get(rid, 0) + 1
 
-        # Place windows on exterior walls
-        windows = self._place_windows(layout)
-
-        # Update layout with openings
-        layout.doors = doors
-        layout.windows = windows
-
+        layout.doors   = doors
+        layout.windows = self._place_windows(layout)
         return layout
 
     def _place_main_entrance(self, layout: Layout) -> Optional[Door]:
-        """Place main entrance door based on facing direction"""
+        """
+        Place the main entrance door on the facing-direction wall of the
+        preferred entrance room (living room > parking > other allowed rooms).
+
+        The door is placed on the plot boundary wall that corresponds to
+        the facing direction, at the x/y of the preferred room, so the
+        entrance always opens into an appropriate space.
+        """
         facing = layout.facing_direction
-        pw = layout.plot_width
-        pl = layout.plot_length
+        pw     = layout.plot_width
+        pl     = layout.plot_length
 
-        # Find the room closest to the entrance side
         entrance_room = self._find_entrance_room(layout)
+        if entrance_room is None:
+            return None
 
+        # Door position: on the plot boundary in the facing direction,
+        # horizontally/vertically centred on the entrance room.
         if facing == "north":
-            x = layout.entrance_position[0]
-            y = 0
+            x           = entrance_room.x + entrance_room.width / 2
+            y           = 0.0
             orientation = "horizontal"
         elif facing == "south":
-            x = layout.entrance_position[0]
-            y = pl
+            x           = entrance_room.x + entrance_room.width / 2
+            y           = pl
             orientation = "horizontal"
         elif facing == "east":
-            x = pw
-            y = layout.entrance_position[1]
+            x           = pw
+            y           = entrance_room.y + entrance_room.height / 2
             orientation = "vertical"
         else:  # west
-            x = 0
-            y = layout.entrance_position[1]
+            x           = 0.0
+            y           = entrance_room.y + entrance_room.height / 2
             orientation = "vertical"
-
-        connects = [entrance_room.id] if entrance_room else []
 
         return Door(
             id="main_entrance",
@@ -92,66 +108,219 @@ class OpeningsPlacer:
             y=y,
             width=self.door_width,
             orientation=orientation,
-            connects=connects,
-            is_main_entrance=True
+            connects=[entrance_room.id],
+            is_main_entrance=True,
         )
 
+    # Room types that may receive the main entrance door (priority order)
+    _ENTRANCE_PRIORITY = ["living_room", "parking", "entrance", "corridor", "dining"]
+    # Room types that must never receive the main entrance door
+    _ENTRANCE_FORBIDDEN = {"bathroom", "toilet", "master_bedroom", "bedroom", "puja_room"}
+
     def _find_entrance_room(self, layout: Layout) -> Optional[Room]:
-        """Find the room closest to the entrance"""
-        facing = layout.facing_direction
+        """
+        Find the best room to receive the main entrance door.
+
+        Priority:
+          1. Living Room or Parking on the entrance side
+          2. Any allowed room on the entrance side (closest to entrance_position)
+          3. Living Room or Parking anywhere in the layout
+          4. Any non-forbidden room (closest to entrance_position)
+        """
+        facing       = layout.facing_direction
         entrance_pos = layout.entrance_position
 
-        best_room = None
-        best_distance = float('inf')
+        # Depth limit = 30 % of the relevant plot dimension (min 8 ft)
+        if facing in ("north", "south"):
+            depth_limit = max(8.0, layout.plot_length * 0.30)
+        else:
+            depth_limit = max(8.0, layout.plot_width  * 0.30)
 
-        for room in layout.rooms:
-            room_center_x = room.x + room.width / 2
-            room_center_y = room.y + room.height / 2
-
-            # Check if room is on the entrance side
+        def on_entrance_side(room: Room) -> bool:
             if facing == "north":
-                if room.y <= 5:  # Room touches or near north wall
-                    dist = abs(room_center_x - entrance_pos[0])
-                    if dist < best_distance:
-                        best_distance = dist
-                        best_room = room
+                return room.y <= depth_limit
             elif facing == "south":
-                if room.y + room.height >= layout.plot_length - 5:
-                    dist = abs(room_center_x - entrance_pos[0])
-                    if dist < best_distance:
-                        best_distance = dist
-                        best_room = room
+                return room.y + room.height >= layout.plot_length - depth_limit
             elif facing == "east":
-                if room.x + room.width >= layout.plot_width - 5:
-                    dist = abs(room_center_y - entrance_pos[1])
-                    if dist < best_distance:
-                        best_distance = dist
-                        best_room = room
+                return room.x + room.width >= layout.plot_width - depth_limit
             else:  # west
-                if room.x <= 5:
-                    dist = abs(room_center_y - entrance_pos[1])
-                    if dist < best_distance:
-                        best_distance = dist
-                        best_room = room
+                return room.x <= depth_limit
 
-        # If no room on entrance side, find closest room
-        if best_room is None and layout.rooms:
-            for room in layout.rooms:
-                room_center_x = room.x + room.width / 2
-                room_center_y = room.y + room.height / 2
-                dist = ((room_center_x - entrance_pos[0])**2 +
-                       (room_center_y - entrance_pos[1])**2)**0.5
-                if dist < best_distance:
-                    best_distance = dist
-                    best_room = room
+        def dist_to_entrance(room: Room) -> float:
+            cx = room.x + room.width  / 2
+            cy = room.y + room.height / 2
+            return ((cx - entrance_pos[0]) ** 2 + (cy - entrance_pos[1]) ** 2) ** 0.5
 
-        return best_room
+        def is_forbidden(room: Room) -> bool:
+            return any(f in room.room_type for f in self._ENTRANCE_FORBIDDEN)
+
+        # Pass 1: preferred type touching the entrance boundary
+        preferred_on_side = [
+            r for r in layout.rooms
+            if on_entrance_side(r)
+            and any(r.room_type == p for p in self._ENTRANCE_PRIORITY)
+        ]
+        if preferred_on_side:
+            return min(preferred_on_side, key=dist_to_entrance)
+
+        # Pass 2: any allowed room touching the entrance boundary
+        # (always choose a room that physically touches the facing wall)
+        allowed_on_side = [
+            r for r in layout.rooms
+            if on_entrance_side(r) and not is_forbidden(r)
+        ]
+        if allowed_on_side:
+            return min(allowed_on_side, key=dist_to_entrance)
+
+        # Pass 3: widen depth to 50% and retry preferred types
+        depth_limit_wide = max(depth_limit * 1.5, layout.plot_length * 0.50
+                               if facing in ("north", "south")
+                               else layout.plot_width * 0.50)
+
+        def on_wide_side(room: Room) -> bool:
+            if facing == "north":
+                return room.y <= depth_limit_wide
+            elif facing == "south":
+                return room.y + room.height >= layout.plot_length - depth_limit_wide
+            elif facing == "east":
+                return room.x + room.width >= layout.plot_width - depth_limit_wide
+            else:
+                return room.x <= depth_limit_wide
+
+        preferred_wide = [
+            r for r in layout.rooms
+            if on_wide_side(r)
+            and any(r.room_type == p for p in self._ENTRANCE_PRIORITY)
+        ]
+        if preferred_wide:
+            return min(preferred_wide, key=dist_to_entrance)
+
+        # Pass 4: any non-forbidden room (closest to entrance_position as fallback)
+        allowed = [r for r in layout.rooms if not is_forbidden(r)]
+        if allowed:
+            return min(allowed, key=dist_to_entrance)
+
+        return layout.rooms[0] if layout.rooms else None
+
+    def _place_parking_entrance(
+        self,
+        layout: Layout,
+        existing_doors: list[Door],
+        door_count_per_room: dict[str, int],
+    ) -> Optional[Door]:
+        """
+        Place an independent external vehicle entrance on the plot boundary
+        for the parking area.
+
+        Rules enforced:
+          - Only if a parking room exists in the layout.
+          - Skipped when the main entrance already opens into parking
+            (no redundant duplicate opening).
+          - Parking must physically touch at least one open (exterior) wall
+            within _BOUNDARY_TOL feet; facing wall is tried first.
+          - Respects MAX_DOORS_PER_ROOM: skipped if parking already has 2 doors.
+          - Width: _PARKING_DOOR_WIDTH (9 ft, vehicle-sized).
+        """
+        _BOUNDARY_TOL = 3.0   # feet — how close to boundary = "touches it"
+
+        parking = next(
+            (r for r in layout.rooms if "parking" in r.room_type.lower()), None
+        )
+        if parking is None:
+            return None
+
+        # If the main entrance already connects to parking, don't duplicate.
+        for door in existing_doors:
+            connected_types = {
+                r.room_type for r in layout.rooms if r.id in door.connects
+            }
+            if any("parking" in rt for rt in connected_types):
+                return None
+
+        # Respect per-room door cap.
+        if door_count_per_room.get(parking.id, 0) >= self.MAX_DOORS_PER_ROOM:
+            return None
+
+        facing     = layout.facing_direction
+        pw         = layout.plot_width
+        pl         = layout.plot_length
+        open_walls = getattr(layout, "open_walls", ["north", "south", "east", "west"])
+
+        # Try facing wall first, then remaining open walls.
+        wall_order = [facing] + [w for w in open_walls if w != facing]
+
+        for wall in wall_order:
+            if wall not in open_walls:
+                continue
+            if wall == "north" and parking.y <= _BOUNDARY_TOL:
+                return Door(
+                    id="parking_entrance",
+                    x=parking.x + parking.width / 2,
+                    y=0.0,
+                    width=self._PARKING_DOOR_WIDTH,
+                    orientation="horizontal",
+                    connects=[parking.id],
+                    is_main_entrance=False,
+                )
+            if wall == "south" and parking.y + parking.height >= pl - _BOUNDARY_TOL:
+                return Door(
+                    id="parking_entrance",
+                    x=parking.x + parking.width / 2,
+                    y=pl,
+                    width=self._PARKING_DOOR_WIDTH,
+                    orientation="horizontal",
+                    connects=[parking.id],
+                    is_main_entrance=False,
+                )
+            if wall == "east" and parking.x + parking.width >= pw - _BOUNDARY_TOL:
+                return Door(
+                    id="parking_entrance",
+                    x=pw,
+                    y=parking.y + parking.height / 2,
+                    width=self._PARKING_DOOR_WIDTH,
+                    orientation="vertical",
+                    connects=[parking.id],
+                    is_main_entrance=False,
+                )
+            if wall == "west" and parking.x <= _BOUNDARY_TOL:
+                return Door(
+                    id="parking_entrance",
+                    x=0.0,
+                    y=parking.y + parking.height / 2,
+                    width=self._PARKING_DOOR_WIDTH,
+                    orientation="vertical",
+                    connects=[parking.id],
+                    is_main_entrance=False,
+                )
+
+        # Parking does not touch any open wall — no external entrance possible.
+        return None
+
+    # Rooms that may serve as a staircase's only entry point
+    _STAIR_ALLOWED_NEIGHBOURS = {"living_room", "parking", "entrance", "corridor"}
+    # Rooms that must not share a door
+    _FORBIDDEN_DOOR_PAIRS: set[frozenset] = {
+        frozenset({"puja_room",  "parking"}),
+        frozenset({"puja_room",  "bathroom"}),
+        frozenset({"kitchen",    "bathroom"}),
+    }
 
     def _place_interior_doors(self, layout: Layout) -> list[Door]:
-        """Place doors between adjacent rooms"""
+        """
+        Place doors between adjacent rooms with architectural rules:
+
+        1. Bedrooms get at most one interior door (private rooms).
+        2. Bedroom-to-bedroom doors are forbidden — bedrooms must not
+           connect directly to each other.
+        3. Staircase doors are only allowed from living room, parking,
+           entrance hall, or corridor.
+        4. Puja room must not connect directly to parking or bathroom.
+        5. Kitchen must not connect directly to bathroom.
+        """
         doors = []
         door_count = 0
-        processed_pairs = set()
+        processed_pairs: set = set()
+        bedroom_door_count: dict[str, int] = {}  # room_id → door count
 
         for i, room1 in enumerate(layout.rooms):
             for j, room2 in enumerate(layout.rooms):
@@ -162,12 +331,42 @@ class OpeningsPlacer:
                 if pair_key in processed_pairs:
                     continue
 
-                # Check if rooms are adjacent
+                t1 = room1.room_type
+                t2 = room2.room_type
+
+                # ── Rule 1: bedroom-to-bedroom forbidden ──────────────────────
+                if "bedroom" in t1 and "bedroom" in t2:
+                    processed_pairs.add(pair_key)
+                    continue
+
+                # ── Rule 2: staircase only from allowed neighbours ─────────────
+                if "staircase" in t1 and t2 not in self._STAIR_ALLOWED_NEIGHBOURS:
+                    processed_pairs.add(pair_key)
+                    continue
+                if "staircase" in t2 and t1 not in self._STAIR_ALLOWED_NEIGHBOURS:
+                    processed_pairs.add(pair_key)
+                    continue
+
+                # ── Rule 3: forbidden room-type pairs ─────────────────────────
+                if frozenset({t1, t2}) in self._FORBIDDEN_DOOR_PAIRS:
+                    processed_pairs.add(pair_key)
+                    continue
+
+                # ── Rule 4: each bedroom may have at most one interior door ────
+                if "bedroom" in t1 and bedroom_door_count.get(room1.id, 0) >= 1:
+                    continue
+                if "bedroom" in t2 and bedroom_door_count.get(room2.id, 0) >= 1:
+                    continue
+
                 door = self._create_door_between_rooms(room1, room2, door_count)
                 if door:
                     doors.append(door)
                     processed_pairs.add(pair_key)
                     door_count += 1
+                    if "bedroom" in t1:
+                        bedroom_door_count[room1.id] = bedroom_door_count.get(room1.id, 0) + 1
+                    if "bedroom" in t2:
+                        bedroom_door_count[room2.id] = bedroom_door_count.get(room2.id, 0) + 1
 
         return doors
 

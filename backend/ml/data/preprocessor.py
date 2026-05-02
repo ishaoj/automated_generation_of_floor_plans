@@ -87,8 +87,9 @@ class FloorPlanPreprocessor:
             # Area
             area_norm = room['area'] / (plot_width * plot_height)
 
-            # Node feature vector: [room_type_onehot, area_norm]
-            node_feat = room_type_onehot + [area_norm]
+            # Node feature vector: [room_type_onehot (11), area (1), x_n, y_n, w_n, h_n (4)] = 16-D
+            # Including normalised position lets GNN condition corrections on each room's location.
+            node_feat = room_type_onehot + [area_norm, x_norm, y_norm, w_norm, h_norm]
             node_features.append(node_feat)
 
             # Store position separately for prediction target

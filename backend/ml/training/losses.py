@@ -21,10 +21,10 @@ class LayoutRefinementLoss(nn.Module):
 
     def __init__(
         self,
-        position_weight: float = 1.0,
-        overlap_weight: float = 5.0,
-        area_weight: float = 0.5,
-        adjacency_weight: float = 0.3,
+        position_weight: float = 5.0,
+        overlap_weight: float = 1.0,
+        area_weight: float = 0.3,
+        adjacency_weight: float = 0.2,
     ):
         """
         Args:

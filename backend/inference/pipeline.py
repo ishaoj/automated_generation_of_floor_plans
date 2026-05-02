@@ -1,29 +1,22 @@
 """
-MLInferencePipeline — end-to-end mandatory ML inference.
+MLInferencePipeline — GNN-only layout refinement.
 
 Pipeline:
   Constraint Solver layout dict
     ↓
-  1. GNN (GraphAttentionRefiner, 12-D)  → refined room positions
+  GNN (GraphAttentionRefiner, 16-D position-aware)
     ↓
-  2. SemanticRenderer                   → 256×256 RGB semantic image
-    ↓
-  3. Pix2Pix UNetGenerator (ngf=32)     → realistic floor plan PNG
-
-Both GNN and Pix2Pix are required. Missing checkpoints raise RuntimeError.
+  Refined room positions (used by FloorPlanRenderer for the primary image)
 """
 
-import base64
-import io
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
 import yaml
-from PIL import Image, ImageFilter, ImageEnhance
 
 # ── Path setup ───────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve()
@@ -33,9 +26,7 @@ for _p in [str(_ROOT), str(_BACK)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ml.models.gnn_refiner      import GraphAttentionRefiner
-from ml.models.generator_unet   import UNetGenerator
-from preprocessing.semantic_renderer import SemanticRenderer
+from ml.models.gnn_refiner import GraphAttentionRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +44,13 @@ def _layout_to_graph(layout: Dict) -> Dict[str, torch.Tensor]:
     """
     Convert constraint-solver layout dict → GNN-ready tensors.
 
-    Node features (12-D): [11-D room-type one-hot | 1-D normalised area]
-    Edge features  (4-D): [distance, Δx, Δy, is_adjacent]
-    Positions      (N×4): normalised (x, y, w, h)
+    Node features (16-D): [11-D room-type one-hot | 1-D area | 4-D normalised (x,y,w,h)]
+    Positions in the node features let the GNN condition corrections on each
+    room's current location, preventing the identity/collapsed-bias failure mode.
+
+    Edge features (4-D): [distance, Δx, Δy, is_adjacent]
+    Positions (N×4): normalised (x, y, w, h)  — still passed separately for
+    the residual add at the end of GraphAttentionRefiner.forward()
     """
     rooms = layout["rooms"]
     pw    = float(layout["plot_width"])
@@ -74,13 +69,17 @@ def _layout_to_graph(layout: Dict) -> Dict[str, torch.Tensor]:
 
         x, y, w, h = float(r["x"]), float(r["y"]), float(r["width"]), float(r["height"])
         area_norm = (w * h) / max(plot_area, 1.0)
-        node_features.append(oh + [area_norm])
+        xn, yn, wn, hn = x / pw, y / pl, w / pw, h / pl
+        # 16-D: room-type one-hot (11) + area (1) + normalised pos+size (4)
+        node_features.append(oh + [area_norm, xn, yn, wn, hn])
 
         positions.append([x / pw, y / pl, w / pw, h / pl])
         centroids.append(((x + w / 2) / pw, (y + h / 2) / pl))
 
     N = len(rooms)
     src, dst, edge_feats = [], [], []
+    THRESHOLD = 2.0   # feet — rooms touching or within 2 ft are adjacent
+
     for i in range(N):
         for j in range(N):
             if i == j:
@@ -91,17 +90,34 @@ def _layout_to_graph(layout: Dict) -> Dict[str, torch.Tensor]:
             dy   = cy2 - cy1
             dist = float(np.sqrt(dx ** 2 + dy ** 2))
 
-            # Adjacency: rooms are neighbours if bboxes are within 2 ft
-            r1, r2   = rooms[i], rooms[j]
-            threshold = 2.0
-            h_ov = (r1["x"] < r2["x"] + r2["width"]  + threshold and
-                    r2["x"] < r1["x"] + r1["width"]  + threshold)
-            v_ov = (r1["y"] < r2["y"] + r2["height"] + threshold and
-                    r2["y"] < r1["y"] + r1["height"] + threshold)
-            adj  = float(h_ov and v_ov)
+            r1, r2 = rooms[i], rooms[j]
+            h_ov = (r1["x"] < r2["x"] + r2["width"]  + THRESHOLD and
+                    r2["x"] < r1["x"] + r1["width"]  + THRESHOLD)
+            v_ov = (r1["y"] < r2["y"] + r2["height"] + THRESHOLD and
+                    r2["y"] < r1["y"] + r1["height"] + THRESHOLD)
 
-            src.append(i); dst.append(j)
-            edge_feats.append([dist, dx, dy, adj])
+            # Sparse adjacency: only add edge if rooms are actually adjacent.
+            # This matches the FloorPlanPreprocessor used during GNN training.
+            # A dense (fully-connected) graph causes GAT oversmoothing: all
+            # nodes collapse to the same representation after 1 layer.
+            if h_ov and v_ov:
+                src.append(i); dst.append(j)
+                edge_feats.append([dist, dx, dy, 1.0])
+
+    # Fallback: if no adjacency found (rooms too spread out), connect each
+    # room only to its two nearest neighbours to preserve node identity.
+    if not src:
+        centroids_arr = [(c[0], c[1]) for c in centroids]
+        for i in range(N):
+            dists = [(float(np.sqrt((centroids_arr[i][0]-centroids_arr[j][0])**2 +
+                                    (centroids_arr[i][1]-centroids_arr[j][1])**2)), j)
+                     for j in range(N) if j != i]
+            dists.sort()
+            for d, j in dists[:2]:
+                dx = centroids_arr[j][0] - centroids_arr[i][0]
+                dy = centroids_arr[j][1] - centroids_arr[i][1]
+                src.append(i); dst.append(j)
+                edge_feats.append([d, dx, dy, 0.0])
 
     if not src:
         src, dst = [0], [0]
@@ -141,24 +157,18 @@ def _apply_refined_positions(refined_pos: torch.Tensor, layout: Dict) -> Dict:
 
 class MLInferencePipeline:
     """
-    End-to-end ML inference: GNN refinement + Pix2Pix rendering.
+    GNN-only layout refinement pipeline.
 
     Args:
-        gnn_path        : path to GNN best_model.pt
-        pix2pix_path    : path to Pix2Pix best_model.pt (full Pix2PixModel ckpt)
-        device          : 'auto' | 'cuda' | 'mps' | 'cpu'
-        image_size      : semantic image resolution (square)
-        ngf             : Pix2Pix generator base channels (must match training)
+        gnn_path : path to GNN best_model.pt (gnn_v3 or later)
+        device   : 'auto' | 'cuda' | 'mps' | 'cpu'
     """
 
     def __init__(
         self,
-        gnn_path:     str,
-        pix2pix_path: str,
-        device:       str = "auto",
-        image_size:   int = 256,
-        ngf:          int = 32,
-        **kwargs,                 # absorb unused config keys
+        gnn_path: str,
+        device:   str = "auto",
+        **kwargs,               # absorb unused config keys (pix2pix_path, etc.)
     ):
         if device == "auto":
             if torch.cuda.is_available():
@@ -167,128 +177,52 @@ class MLInferencePipeline:
                 device = "mps"
             else:
                 device = "cpu"
-        self.device     = device
-        self.image_size = image_size
+        self.device = device
 
-        # ── Load GNN ──────────────────────────────────────────────────────
         gnn_path_obj = Path(gnn_path)
+        # If a relative path is given, resolve it from the project root
+        if not gnn_path_obj.is_absolute():
+            gnn_path_obj = (_ROOT / gnn_path).resolve()
         if not gnn_path_obj.exists():
             raise RuntimeError(
-                f"[PIPELINE] GNN model not found at: {gnn_path}\n"
+                f"[PIPELINE] GNN model not found at: {gnn_path_obj}\n"
                 "Train with: python backend/ml/training/train_gnn.py"
             )
+        gnn_path = str(gnn_path_obj)
         ckpt = torch.load(gnn_path, map_location=device, weights_only=False)
         self.gnn = GraphAttentionRefiner(
-            node_features_dim=12,
+            node_features_dim=16,
             edge_features_dim=4,
             hidden_dim=128,
             num_gat_layers=3,
             num_heads=4,
         ).to(device)
-        sd = ckpt.get("model_state_dict", ckpt)
-        self.gnn.load_state_dict(sd)
+        self.gnn.load_state_dict(ckpt.get("model_state_dict", ckpt))
         self.gnn.eval()
-        logger.info(f"[PIPELINE] GNN loaded from {gnn_path}")
-
-        # ── Load Pix2Pix generator ─────────────────────────────────────────
-        p2p_path_obj = Path(pix2pix_path)
-        if not p2p_path_obj.exists():
-            raise RuntimeError(
-                f"[PIPELINE] Pix2Pix model not found at: {pix2pix_path}\n"
-                "Train with: python backend/ml/training/train_pix2pix.py"
-            )
-        p2p_ckpt = torch.load(pix2pix_path, map_location=device, weights_only=False)
-        raw_sd   = p2p_ckpt.get("model_state_dict", p2p_ckpt)
-
-        # Strip torch.compile() prefix and extract just generator weights
-        gen_sd = {}
-        for k, v in raw_sd.items():
-            k = k.replace("_orig_mod.", "")          # torch.compile prefix
-            if k.startswith("generator."):
-                gen_sd[k[len("generator."):]] = v    # drop "generator." prefix
-
-        self.generator = UNetGenerator(
-            in_channels=3, out_channels=3, ngf=ngf
-        ).to(device)
-        self.generator.load_state_dict(gen_sd)
-        self.generator.eval()
-        logger.info(f"[PIPELINE] Pix2Pix generator (ngf={ngf}) loaded from {pix2pix_path}")
-
-        # ── Semantic renderer ──────────────────────────────────────────────
-        self.renderer = SemanticRenderer(image_size=image_size)
-
-        logger.info(f"[PIPELINE] Ready  device={device}  image_size={image_size}")
+        logger.info(f"[PIPELINE] GNN loaded from {gnn_path}  device={device}")
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def generate(self, layout: Dict) -> str:
+    def generate(self, layout: Dict) -> Dict:
         """
-        Run GNN + Pix2Pix on a constraint-solver layout dict.
+        Run GNN refinement on a constraint-solver layout dict.
 
-        Returns base64-encoded PNG string.
+        Returns:
+            {"refined_rooms": list[dict]}  — GNN-adjusted room positions
         """
-        # 1. GNN refinement
-        graph     = _layout_to_graph(layout)
-        nf        = graph["node_features"].to(self.device)
-        ei        = graph["edge_index"].to(self.device)
-        ea        = graph["edge_attr"].to(self.device)
-        pos       = graph["positions"].to(self.device)
-
-        refined   = self.gnn(
-            node_features=nf,
-            edge_index=ei,
-            edge_attr=ea,
-            positions=pos,
-        )                                        # (N, 4) normalised
-
+        graph = _layout_to_graph(layout)
+        refined = self.gnn(
+            node_features=graph["node_features"].to(self.device),
+            edge_index=graph["edge_index"].to(self.device),
+            edge_attr=graph["edge_attr"].to(self.device),
+            positions=graph["positions"].to(self.device),
+        )
         refined_layout = _apply_refined_positions(refined, layout)
-
-        # 2. Semantic image
-        rooms_for_renderer = [
-            {
-                "type":     r["room_type"],
-                "zone":     r.get("zone"),
-                "bbox_norm": (
-                    r["x"] / layout["plot_width"],
-                    r["y"] / layout["plot_length"],
-                    r["width"]  / layout["plot_width"],
-                    r["height"] / layout["plot_length"],
-                ),
-            }
-            for r in refined_layout["rooms"]
-        ]
-        sem_arr = self.renderer.render_from_normalized(rooms_for_renderer)  # H×W×3
-
-        sem_tensor = (
-            torch.from_numpy(sem_arr)
-            .permute(2, 0, 1)
-            .float()
-            .unsqueeze(0)
-            / 127.5 - 1.0
-        ).to(self.device)                        # (1, 3, H, W)
-
-        # 3. Pix2Pix
-        fake      = self.generator(sem_tensor)   # (1, 3, H, W) in [-1, 1]
-        img_arr   = ((fake.squeeze(0).clamp(-1, 1) + 1) / 2 * 255).byte()
-        img_arr   = img_arr.permute(1, 2, 0).cpu().numpy()
-        img       = Image.fromarray(img_arr, "RGB")
-
-        # Post-process: upscale + sharpen to compensate for soft early output
-        out_size  = self.image_size * 2
-        img = img.resize((out_size, out_size), Image.LANCZOS)
-        img = ImageEnhance.Contrast(img).enhance(2.0)
-        img = ImageEnhance.Sharpness(img).enhance(2.5)
-        img = img.filter(ImageFilter.SHARPEN)
-        img = ImageEnhance.Brightness(img).enhance(1.1)
-
-        # 4. Base64 encode
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+        return {"refined_rooms": refined_layout["rooms"]}
 
     @torch.no_grad()
-    def generate_batch(self, layouts: List[Dict]) -> List[str]:
+    def generate_batch(self, layouts: List[Dict]) -> List[Dict]:
         return [self.generate(layout) for layout in layouts]
 
     # ── Factory ───────────────────────────────────────────────────────────────
@@ -298,9 +232,6 @@ class MLInferencePipeline:
         with open(config_path) as fh:
             cfg = yaml.safe_load(fh)
         return cls(
-            gnn_path     = cfg["gnn"]["model_path"],
-            pix2pix_path = cfg["pix2pix"]["model_path"],
-            device       = cfg["inference"].get("device", "auto"),
-            image_size   = cfg["inference"].get("semantic_image_size", 256),
-            ngf          = cfg["pix2pix"].get("ngf", 32),
+            gnn_path = cfg["gnn"]["model_path"],
+            device   = cfg["inference"].get("device", "auto"),
         )

@@ -1,0 +1,54 @@
+model:
+  node_features_dim: 24      # 13 room_type_onehot + 1 area + 1 aspect_ratio + 9 zone_onehot
+  edge_features_dim: 5       # dist, dx, dy, is_adjacent, shared_wall_frac
+  hidden_dim: 256
+  num_gat_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  output_dim: 4              # delta: x, y, w, h
+
+data:
+  data_dir: "data/cubicasa5k_extracted/cubicasa5k"
+  batch_size: 32
+  num_workers: 0   # 0 = single-process loading (required on macOS — fd limit)
+  min_rooms: 2
+  max_rooms: 12
+  normalize_coords: true
+  filter_non_residential: true
+
+training:
+  epochs: 100
+  lr: 0.001
+  weight_decay: 1.0e-4
+  patience: 15
+  use_vastu_loss: true
+  use_distributed: false
+  gradient_clip: 1.0
+
+loss:
+  position_weight: 1.0
+  overlap_weight: 10.0
+  area_weight: 0.5
+  adjacency_weight: 0.3
+  vastu_weight: 0.5
+
+augmentation:
+  enabled: true
+  flip_horizontal_p: 0.5
+  flip_vertical_p: 0.5
+  rotate_90_p: 0.25
+  area_jitter: 0.1
+
+checkpoint:
+  save_dir: "backend/models/saved/gnn"
+  save_best: true
+  save_every_n_epochs: 10
+  keep_n_best: 3
+  metric: "val_position_mse"
+  mode: "min"
+
+logging:
+  use_tensorboard: true
+  use_wandb: false
+  wandb_project: "vastu-ai-gnn"
+  log_every_n_batches: 10

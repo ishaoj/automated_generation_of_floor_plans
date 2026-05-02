@@ -36,6 +36,13 @@ class VastuConstraintSolver:
     4. Maximize Vastu compliance
     """
 
+    # Hard upper bounds on room area (sq ft).
+    # Prevents the coverage objective from inflating utility rooms.
+    _MAX_ROOM_AREAS: dict[str, int] = {
+        "bathroom": 60,
+        "puja_room": 100,
+    }
+
     def __init__(self, grid_size: int = 1):
         """
         Initialize solver
@@ -110,6 +117,20 @@ class VastuConstraintSolver:
         self._add_min_area_constraints(room_vars)
         self._add_aspect_ratio_constraints(room_vars)
         self._add_ots_center_constraint(room_vars, plot_width, plot_height)
+        self._add_bathroom_separation_constraints(room_vars)
+        self._add_bedroom_separation_constraints(room_vars)
+        self._add_bathroom_kitchen_separation_constraints(room_vars)
+        self._add_bathroom_puja_separation_constraints(room_vars)
+        self._add_puja_parking_separation_constraints(room_vars)
+        self._add_ensuite_pairing_constraints(room_vars)
+        self._add_living_dining_adjacency_constraint(room_vars)
+        self._add_dining_kitchen_adjacency_constraint(room_vars)
+        self._add_bathroom_adjacent_to_bedroom_constraint(room_vars)
+        self._add_bedroom_circulation_access_constraint(room_vars)
+        self._add_staircase_zone_constraint(room_vars)
+        self._add_staircase_bedroom_separation_constraint(room_vars)
+        self._add_balcony_orientation_constraint(room_vars, plot_width, plot_height)
+        self._add_kitchen_zone_avoidance_constraint(room_vars, plot_width, plot_height)
 
         # Calculate room density to decide complexity level
         plot_area = plot_width * plot_height
@@ -153,14 +174,13 @@ class VastuConstraintSolver:
 
         self.model.Maximize(total_objective)
 
-        # Solve with increased timeout for complex layouts
         self.solver = cp_model.CpSolver()
-        # More time and workers for complex problems
         if num_rooms > 8:
-            self.solver.parameters.max_time_in_seconds = 20.0
-            self.solver.parameters.num_search_workers = 4  # Parallel search
+            self.solver.parameters.max_time_in_seconds = 12.0
+            self.solver.parameters.num_search_workers = 4
         else:
-            self.solver.parameters.max_time_in_seconds = 10.0
+            # 5 s is enough to find a good feasible solution for ≤8 rooms
+            self.solver.parameters.max_time_in_seconds = 5.0
         self.solver.parameters.random_seed = seed if seed else random.randint(0, 10000)
 
         status = self.solver.Solve(self.model)
@@ -264,13 +284,34 @@ class VastuConstraintSolver:
                 self.model.AddBoolOr([b1, b2, b3, b4])
 
     def _add_min_area_constraints(self, room_vars: dict):
-        """Ensure rooms meet minimum area requirements"""
+        """Enforce minimum AND maximum area per room type.
+
+        Max caps prevent the coverage objective from inflating bathrooms and
+        puja rooms beyond realistic sizes, maintaining spatial hierarchy
+        (bedrooms always visibly larger than utility spaces).
+        Area variable is stored in vars["area"] for use by other constraints.
+        """
         for room_id, vars in room_vars.items():
+            room_type = vars["node"].room_type.lower()
             min_area_grid = int(vars["node"].min_area / (self.grid_size ** 2))
-            # w * h >= min_area (linearized using auxiliary variable)
-            area = self.model.NewIntVar(min_area_grid, 10000, f"{room_id}_area")
+
+            # Resolve per-type maximum (default: uncapped at 10 000 sq ft)
+            cap_sqft = next(
+                (v for k, v in self._MAX_ROOM_AREAS.items() if k in room_type),
+                10_000,
+            )
+            max_area_grid = max(
+                int(cap_sqft / (self.grid_size ** 2)),
+                min_area_grid + 1,   # always strictly above minimum
+            )
+
+            area = self.model.NewIntVar(min_area_grid, max_area_grid, f"{room_id}_area")
             self.model.AddMultiplicationEquality(area, [vars["w"], vars["h"]])
             self.model.Add(area >= min_area_grid)
+            self.model.Add(area <= max_area_grid)
+
+            # Store so downstream constraints can reference the area variable
+            vars["area"] = area
 
     def _add_aspect_ratio_constraints(self, room_vars: dict):
         """
@@ -287,16 +328,19 @@ class VastuConstraintSolver:
         for room_id, vars in room_vars.items():
             room_type = vars["node"].room_type.lower()
 
-            # Balconies and staircases can be more elongated (1:4 ratio)
+            # Balconies and staircases can be elongated (1:4)
             if "balcony" in room_type or "staircase" in room_type:
-                # w >= h/4 and h >= w/4 → 4w >= h and 4h >= w
                 self.model.Add(4 * vars["w"] >= vars["h"])
                 self.model.Add(4 * vars["h"] >= vars["w"])
+            # Bathrooms and puja rooms must be compact (max 1:2)
+            elif "bathroom" in room_type or "toilet" in room_type \
+                    or "puja" in room_type or "prayer" in room_type:
+                self.model.Add(2 * vars["w"] >= vars["h"])
+                self.model.Add(2 * vars["h"] >= vars["w"])
             else:
-                # Normal rooms: 1:3 ratio max
-                # w >= h/3 and h >= w/3 → 3w >= h and 3h >= w
-                self.model.Add(3 * vars["w"] >= vars["h"])
-                self.model.Add(3 * vars["h"] >= vars["w"])
+                # All other rooms: max 1:2.5 ratio (tighter than old 1:3)
+                self.model.Add(5 * vars["w"] >= 2 * vars["h"])
+                self.model.Add(5 * vars["h"] >= 2 * vars["w"])
 
     def _add_ots_center_constraint(
         self,
@@ -337,6 +381,409 @@ class VastuConstraintSolver:
                 self.model.Add(2 * vars["w"] >= vars["h"])
                 self.model.Add(2 * vars["h"] >= vars["w"])
 
+    def _add_bathroom_separation_constraints(self, room_vars: dict) -> None:
+        """
+        Hard constraint: bathrooms must not share walls with each other.
+        Enforces at least 1 grid-unit gap between every pair of bathrooms.
+        """
+        bath_ids = [
+            rid for rid, v in room_vars.items()
+            if "bathroom" in v["node"].room_type.lower()
+            or "toilet" in v["node"].room_type.lower()
+        ]
+
+        for i in range(len(bath_ids)):
+            for j in range(i + 1, len(bath_ids)):
+                b1 = room_vars[bath_ids[i]]
+                b2 = room_vars[bath_ids[j]]
+
+                # At least one direction must have a gap >= 1 (not adjacent)
+                sep_l = self.model.NewBoolVar(f"bath_sep_l_{i}_{j}")
+                sep_r = self.model.NewBoolVar(f"bath_sep_r_{i}_{j}")
+                sep_t = self.model.NewBoolVar(f"bath_sep_t_{i}_{j}")
+                sep_b = self.model.NewBoolVar(f"bath_sep_b_{i}_{j}")
+
+                self.model.Add(b1["x"] + b1["w"] + 1 <= b2["x"]).OnlyEnforceIf(sep_l)
+                self.model.Add(b2["x"] + b2["w"] + 1 <= b1["x"]).OnlyEnforceIf(sep_r)
+                self.model.Add(b1["y"] + b1["h"] + 1 <= b2["y"]).OnlyEnforceIf(sep_t)
+                self.model.Add(b2["y"] + b2["h"] + 1 <= b1["y"]).OnlyEnforceIf(sep_b)
+
+                self.model.AddBoolOr([sep_l, sep_r, sep_t, sep_b])
+
+    def _add_bedroom_separation_constraints(self, room_vars: dict) -> None:
+        """
+        Hard constraint: bedrooms must not share walls with each other.
+        Each bedroom should be a private space — direct bedroom-to-bedroom
+        adjacency breaks the separation of private spaces.
+        """
+        bedroom_ids = [
+            rid for rid, v in room_vars.items()
+            if "bedroom" in v["node"].room_type.lower()
+        ]
+        for i in range(len(bedroom_ids)):
+            for j in range(i + 1, len(bedroom_ids)):
+                b1 = room_vars[bedroom_ids[i]]
+                b2 = room_vars[bedroom_ids[j]]
+                sep_l = self.model.NewBoolVar(f"bed_sep_l_{i}_{j}")
+                sep_r = self.model.NewBoolVar(f"bed_sep_r_{i}_{j}")
+                sep_t = self.model.NewBoolVar(f"bed_sep_t_{i}_{j}")
+                sep_b = self.model.NewBoolVar(f"bed_sep_b_{i}_{j}")
+                self.model.Add(b1["x"] + b1["w"] + 1 <= b2["x"]).OnlyEnforceIf(sep_l)
+                self.model.Add(b2["x"] + b2["w"] + 1 <= b1["x"]).OnlyEnforceIf(sep_r)
+                self.model.Add(b1["y"] + b1["h"] + 1 <= b2["y"]).OnlyEnforceIf(sep_t)
+                self.model.Add(b2["y"] + b2["h"] + 1 <= b1["y"]).OnlyEnforceIf(sep_b)
+                self.model.AddBoolOr([sep_l, sep_r, sep_t, sep_b])
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
+
+    def _enforce_two_room_separation(self, r1: dict, r2: dict, prefix: str) -> None:
+        """Rooms r1 and r2 must NOT share a wall (gap ≥ 1 grid unit in at least one direction)."""
+        sep_l = self.model.NewBoolVar(f"{prefix}_sl")
+        sep_r = self.model.NewBoolVar(f"{prefix}_sr")
+        sep_t = self.model.NewBoolVar(f"{prefix}_st")
+        sep_b = self.model.NewBoolVar(f"{prefix}_sb")
+        self.model.Add(r1["x"] + r1["w"] + 1 <= r2["x"]).OnlyEnforceIf(sep_l)
+        self.model.Add(r2["x"] + r2["w"] + 1 <= r1["x"]).OnlyEnforceIf(sep_r)
+        self.model.Add(r1["y"] + r1["h"] + 1 <= r2["y"]).OnlyEnforceIf(sep_t)
+        self.model.Add(r2["y"] + r2["h"] + 1 <= r1["y"]).OnlyEnforceIf(sep_b)
+        self.model.AddBoolOr([sep_l, sep_r, sep_t, sep_b])
+
+    def _make_adjacency_bools(self, r1: dict, r2: dict, prefix: str) -> list:
+        """
+        Create 4 directional adjacency booleans for the r1–r2 pair.
+
+        Each bool b, when True, enforces touching in that direction with ≥1-unit
+        perpendicular overlap.  No AddBoolOr is added — callers decide whether
+        all-must-hold, at-least-one-must-hold, or some other combination.
+
+        Returns [b_r, b_l, b_b, b_a] where:
+          b_r = r2 immediately right of r1
+          b_l = r2 immediately left  of r1
+          b_b = r2 immediately below r1
+          b_a = r2 immediately above r1
+        """
+        b_r = self.model.NewBoolVar(f"{prefix}_r")
+        b_l = self.model.NewBoolVar(f"{prefix}_l")
+        b_b = self.model.NewBoolVar(f"{prefix}_b")
+        b_a = self.model.NewBoolVar(f"{prefix}_a")
+
+        self.model.Add(r2["x"] == r1["x"] + r1["w"]).OnlyEnforceIf(b_r)
+        self.model.Add(r1["y"] + 1 <= r2["y"] + r2["h"]).OnlyEnforceIf(b_r)
+        self.model.Add(r2["y"] + 1 <= r1["y"] + r1["h"]).OnlyEnforceIf(b_r)
+
+        self.model.Add(r1["x"] == r2["x"] + r2["w"]).OnlyEnforceIf(b_l)
+        self.model.Add(r1["y"] + 1 <= r2["y"] + r2["h"]).OnlyEnforceIf(b_l)
+        self.model.Add(r2["y"] + 1 <= r1["y"] + r1["h"]).OnlyEnforceIf(b_l)
+
+        self.model.Add(r2["y"] == r1["y"] + r1["h"]).OnlyEnforceIf(b_b)
+        self.model.Add(r1["x"] + 1 <= r2["x"] + r2["w"]).OnlyEnforceIf(b_b)
+        self.model.Add(r2["x"] + 1 <= r1["x"] + r1["w"]).OnlyEnforceIf(b_b)
+
+        self.model.Add(r1["y"] == r2["y"] + r2["h"]).OnlyEnforceIf(b_a)
+        self.model.Add(r1["x"] + 1 <= r2["x"] + r2["w"]).OnlyEnforceIf(b_a)
+        self.model.Add(r2["x"] + 1 <= r1["x"] + r1["w"]).OnlyEnforceIf(b_a)
+
+        return [b_r, b_l, b_b, b_a]
+
+    def _enforce_two_room_adjacency(self, r1: dict, r2: dict, prefix: str) -> None:
+        """
+        Rooms r1 and r2 MUST share exactly one wall (touching with ≥1-unit overlap).
+        One of four touching directions is enforced, each with its perpendicular overlap.
+        """
+        self.model.AddBoolOr(self._make_adjacency_bools(r1, r2, prefix))
+
+    # ── New hard architectural constraints ─────────────────────────────────────
+
+    def _add_bathroom_kitchen_separation_constraints(self, room_vars: dict) -> None:
+        """Hard: bathrooms and kitchen must not share a wall."""
+        bath_ids    = [rid for rid, v in room_vars.items()
+                       if "bathroom" in v["node"].room_type.lower()]
+        kitchen_ids = [rid for rid, v in room_vars.items()
+                       if "kitchen"  in v["node"].room_type.lower()]
+        for bi, bid in enumerate(bath_ids):
+            for ki, kid in enumerate(kitchen_ids):
+                self._enforce_two_room_separation(
+                    room_vars[bid], room_vars[kid], f"bk_{bi}_{ki}"
+                )
+
+    def _add_bathroom_puja_separation_constraints(self, room_vars: dict) -> None:
+        """Hard: bathrooms and puja room must not share a wall."""
+        bath_ids = [rid for rid, v in room_vars.items()
+                    if "bathroom" in v["node"].room_type.lower()]
+        puja_ids = [rid for rid, v in room_vars.items()
+                    if "puja" in v["node"].room_type.lower()
+                    or "prayer" in v["node"].room_type.lower()]
+        for bi, bid in enumerate(bath_ids):
+            for pi, pid in enumerate(puja_ids):
+                self._enforce_two_room_separation(
+                    room_vars[bid], room_vars[pid], f"bp_{bi}_{pi}"
+                )
+
+    def _add_puja_parking_separation_constraints(self, room_vars: dict) -> None:
+        """Hard: puja room and parking must not share a wall (Rule 8)."""
+        puja_ids    = [rid for rid, v in room_vars.items()
+                       if "puja" in v["node"].room_type.lower()
+                       or "prayer" in v["node"].room_type.lower()]
+        parking_ids = [rid for rid, v in room_vars.items()
+                       if "parking" in v["node"].room_type.lower()]
+        for pi, pid in enumerate(puja_ids):
+            for ki, kid in enumerate(parking_ids):
+                self._enforce_two_room_separation(
+                    room_vars[pid], room_vars[kid], f"puja_pkg_{pi}_{ki}"
+                )
+
+    def _add_ensuite_pairing_constraints(self, room_vars: dict) -> None:
+        """
+        For exactly 2-bedroom + 2-bathroom layouts enforce ensuite pairing:
+          bedroom[0] ↔ bathroom[0] must be adjacent (share a wall)
+          bedroom[1] ↔ bathroom[1] must be adjacent (share a wall)
+          Cross pairs (bed[0]↔bath[1], bed[1]↔bath[0]) must be separated.
+        """
+        bedroom_ids = [rid for rid, v in room_vars.items()
+                       if "bedroom" in v["node"].room_type.lower()]
+        bath_ids    = [rid for rid, v in room_vars.items()
+                       if "bathroom" in v["node"].room_type.lower()]
+
+        if len(bedroom_ids) != 2 or len(bath_ids) != 2:
+            return
+
+        # Enforce paired adjacency
+        for i, (bed_id, bath_id) in enumerate(zip(bedroom_ids, bath_ids)):
+            self._enforce_two_room_adjacency(
+                room_vars[bed_id], room_vars[bath_id], f"ensuite_{i}"
+            )
+
+        # Enforce cross-pair separation: unpaired beds and baths must not touch
+        self._enforce_two_room_separation(
+            room_vars[bedroom_ids[0]], room_vars[bath_ids[1]], "cross_0_1"
+        )
+        self._enforce_two_room_separation(
+            room_vars[bedroom_ids[1]], room_vars[bath_ids[0]], "cross_1_0"
+        )
+
+    def _add_living_dining_adjacency_constraint(self, room_vars: dict) -> None:
+        """Hard: living room and dining must share a wall for functional flow."""
+        living_ids = [rid for rid, v in room_vars.items()
+                      if "living" in v["node"].room_type.lower()]
+        dining_ids = [rid for rid, v in room_vars.items()
+                      if "dining" in v["node"].room_type.lower()]
+        if not living_ids or not dining_ids:
+            return
+        self._enforce_two_room_adjacency(
+            room_vars[living_ids[0]], room_vars[dining_ids[0]], "ld"
+        )
+
+    def _add_dining_kitchen_adjacency_constraint(self, room_vars: dict) -> None:
+        """Hard: dining and kitchen must share a wall (Dining → Kitchen flow)."""
+        dining_ids  = [rid for rid, v in room_vars.items()
+                       if "dining"  in v["node"].room_type.lower()]
+        kitchen_ids = [rid for rid, v in room_vars.items()
+                       if "kitchen" in v["node"].room_type.lower()]
+        if not dining_ids or not kitchen_ids:
+            return
+        self._enforce_two_room_adjacency(
+            room_vars[dining_ids[0]], room_vars[kitchen_ids[0]], "dk"
+        )
+
+    def _add_bathroom_adjacent_to_bedroom_constraint(self, room_vars: dict) -> None:
+        """
+        Hard: every bathroom must share a wall with at least one bedroom.
+
+        Works for all bedroom/bathroom counts, not just 2+2.
+        For 2+2 layouts ensuite pairing already satisfies this; the extra
+        booleans created here are trivially satisfied and add negligible cost.
+        """
+        bedroom_ids = [rid for rid, v in room_vars.items()
+                       if "bedroom" in v["node"].room_type.lower()]
+        bath_ids    = [rid for rid, v in room_vars.items()
+                       if "bathroom" in v["node"].room_type.lower()]
+        if not bedroom_ids or not bath_ids:
+            return
+
+        for bi, bid in enumerate(bath_ids):
+            all_touch_bools: list = []
+            for bedi, bedid in enumerate(bedroom_ids):
+                bools = self._make_adjacency_bools(
+                    room_vars[bid], room_vars[bedid], f"bath_adj_bed_{bi}_{bedi}"
+                )
+                all_touch_bools.extend(bools)
+            # At least one directional touch with at least one bedroom
+            self.model.AddBoolOr(all_touch_bools)
+
+    def _add_bedroom_circulation_access_constraint(self, room_vars: dict) -> None:
+        """
+        Hard: every bedroom must be adjacent to at least one circulation space
+        (living room, dining, corridor, entrance, or lobby).
+
+        This single constraint enforces the full set of independent-access rules:
+          • No bedroom is entered through a bathroom — if a bedroom already has
+            direct contact with a circulation space, the bathroom on its other
+            wall is a dead-end attachment, never the only path.
+          • No bedroom-to-bedroom passages — bedrooms each touch the common zone
+            independently; they never need to route through each other.
+          • Bathrooms cannot act as connectors — any bathroom wedged between a
+            bedroom and the rest of the plan violates this (the bedroom would have
+            no direct circulation contact), so the solver will not produce that.
+          • A shared bathroom between two bedrooms remains valid: both bedrooms
+            touch circulation independently, so the bathroom is never a passage.
+        """
+        bedroom_ids = [rid for rid, v in room_vars.items()
+                       if "bedroom" in v["node"].room_type.lower()]
+
+        # Rooms that constitute valid circulation / common areas
+        circulation_ids = [
+            rid for rid, v in room_vars.items()
+            if any(t in v["node"].room_type.lower()
+                   for t in ("living", "dining", "corridor", "entrance", "lobby"))
+        ]
+
+        if not bedroom_ids or not circulation_ids:
+            # If the plan has no circulation spaces (unusual), skip rather than
+            # making it infeasible — the validator will catch it post-generation.
+            return
+
+        for bi, bid in enumerate(bedroom_ids):
+            all_touch_bools: list = []
+            for ci, cid in enumerate(circulation_ids):
+                bools = self._make_adjacency_bools(
+                    room_vars[bid], room_vars[cid], f"bed_circ_{bi}_{ci}"
+                )
+                all_touch_bools.extend(bools)
+            # At least one direction with at least one circulation room
+            self.model.AddBoolOr(all_touch_bools)
+
+    def _add_staircase_zone_constraint(self, room_vars: dict) -> None:
+        """
+        Hard: staircase must be adjacent to parking OR the living room.
+
+        Implements the rule that a staircase may only be positioned within
+        the parking zone or the living area — never isolated in a bedroom
+        corridor or purely private zone.
+        """
+        stair_ids   = [rid for rid, v in room_vars.items()
+                       if "staircase" in v["node"].room_type.lower()]
+        living_ids  = [rid for rid, v in room_vars.items()
+                       if "living"   in v["node"].room_type.lower()]
+        parking_ids = [rid for rid, v in room_vars.items()
+                       if "parking"  in v["node"].room_type.lower()]
+
+        allowed_ids = living_ids + parking_ids
+        if not stair_ids or not allowed_ids:
+            return
+
+        for si, sid in enumerate(stair_ids):
+            all_touch_bools: list = []
+            for idx, nid in enumerate(allowed_ids):
+                bools = self._make_adjacency_bools(
+                    room_vars[sid], room_vars[nid], f"stair_zone_{si}_{idx}"
+                )
+                all_touch_bools.extend(bools)
+            self.model.AddBoolOr(all_touch_bools)
+
+    def _add_staircase_bedroom_separation_constraint(self, room_vars: dict) -> None:
+        """
+        Hard: staircase must not share a wall with any bedroom.
+
+        Staircases in bedroom zones create noise and privacy violations;
+        this paired with _add_staircase_zone_constraint fully confines
+        the staircase to parking / living zones.
+        """
+        stair_ids = [rid for rid, v in room_vars.items()
+                     if "staircase" in v["node"].room_type.lower()]
+        bed_ids   = [rid for rid, v in room_vars.items()
+                     if "bedroom"   in v["node"].room_type.lower()]
+
+        for si, sid in enumerate(stair_ids):
+            for bi, bid in enumerate(bed_ids):
+                self._enforce_two_room_separation(
+                    room_vars[sid], room_vars[bid], f"stair_bed_{si}_{bi}"
+                )
+
+    def _add_balcony_orientation_constraint(
+        self, room_vars: dict, plot_width: int, plot_height: int
+    ) -> None:
+        """
+        Hard constraint: balcony must touch the North or East boundary wall.
+
+        Vastu assigns balconies to the N, E, or NE zones — the open, airy sides
+        of the plot that receive morning light and avoid harsh afternoon sun/heat
+        from the S and W walls.  Placing a balcony on the S or W wall violates
+        both Vastu and passive-cooling principles.
+
+        Implementation: at least one of two booleans must be true —
+          bn : balcony top edge at y=0 (North boundary)
+          be : balcony right edge at x=plot_width (East boundary)
+        This means the balcony can sit on the North wall, the East wall, or
+        the NE corner (both conditions satisfied simultaneously).
+        """
+        balcony_ids = [
+            rid for rid, v in room_vars.items()
+            if "balcony" in v["node"].room_type.lower()
+        ]
+        for bid in balcony_ids:
+            v = room_vars[bid]
+            # b_north: balcony top edge touches y=0
+            b_north = self.model.NewBoolVar(f"{bid}_on_north_wall")
+            self.model.Add(v["y"] == 0).OnlyEnforceIf(b_north)
+            self.model.Add(v["y"] != 0).OnlyEnforceIf(b_north.Not())
+
+            # b_east: balcony right edge touches x=plot_width
+            b_east = self.model.NewBoolVar(f"{bid}_on_east_wall")
+            self.model.Add(v["x"] + v["w"] == plot_width).OnlyEnforceIf(b_east)
+            self.model.Add(v["x"] + v["w"] != plot_width).OnlyEnforceIf(b_east.Not())
+
+            # At least one boundary must be satisfied
+            self.model.AddBoolOr([b_north, b_east])
+
+    def _add_kitchen_zone_avoidance_constraint(
+        self, room_vars: dict, plot_width: int, plot_height: int
+    ) -> None:
+        """
+        Hard constraint: kitchen must not occupy the NE zone of the plot.
+
+        NE is the Water/Purity zone — placing a fire-element room (kitchen) here
+        is the most serious Vastu violation.  SW (earth) and Center (Brahmasthan)
+        are also forbidden for the kitchen.
+
+        This is enforced as a hard positional exclusion: the kitchen centre must
+        not fall inside the NE quadrant (x > 0.67*pw AND y < 0.33*ph).
+        SW quadrant: x < 0.33*pw AND y > 0.67*ph.
+        Center: 0.33*pw < x < 0.67*pw AND 0.33*ph < y < 0.67*ph.
+
+        We exclude only NE here (most critical); the Vastu objective already
+        penalises SW and Center placements heavily via zone scoring.
+        """
+        kitchen_ids = [
+            rid for rid, v in room_vars.items()
+            if "kitchen" in v["node"].room_type.lower()
+        ]
+        ne_x_min = int(0.67 * plot_width)
+        ne_y_max = int(0.33 * plot_height)
+
+        for kid in kitchen_ids:
+            v = room_vars[kid]
+            # Kitchen centre x = x + w//2, centre y = y + h//2
+            cx = self.model.NewIntVar(0, plot_width,  f"{kid}_cx")
+            cy = self.model.NewIntVar(0, plot_height, f"{kid}_cy")
+            self.model.Add(2 * cx == 2 * v["x"] + v["w"])
+            self.model.Add(2 * cy == 2 * v["y"] + v["h"])
+
+            # Boolean: centre is in NE quadrant (x > ne_x_min AND y < ne_y_max)
+            in_ne_x = self.model.NewBoolVar(f"{kid}_ne_x")
+            in_ne_y = self.model.NewBoolVar(f"{kid}_ne_y")
+            in_ne   = self.model.NewBoolVar(f"{kid}_in_ne")
+
+            self.model.Add(cx > ne_x_min).OnlyEnforceIf(in_ne_x)
+            self.model.Add(cx <= ne_x_min).OnlyEnforceIf(in_ne_x.Not())
+            self.model.Add(cy < ne_y_max).OnlyEnforceIf(in_ne_y)
+            self.model.Add(cy >= ne_y_max).OnlyEnforceIf(in_ne_y.Not())
+
+            self.model.AddBoolAnd([in_ne_x, in_ne_y]).OnlyEnforceIf(in_ne)
+            self.model.AddBoolOr([in_ne_x.Not(), in_ne_y.Not()]).OnlyEnforceIf(in_ne.Not())
+
+            # Kitchen must NOT be in NE
+            self.model.Add(in_ne == 0)
+
     def _add_coverage_objective(
         self,
         room_vars: dict,
@@ -371,6 +818,35 @@ class VastuConstraintSolver:
         self.model.Add(total_dim_score == sum(dimension_scores))
 
         return total_dim_score
+
+    def _parking_entrance_score(
+        self,
+        vars: dict,
+        facing: str,
+        plot_width: int,
+        plot_height: int,
+    ) -> cp_model.IntVar:
+        """
+        Returns a linear CP expression that is highest when parking is
+        adjacent to the entrance wall — used as a soft objective term.
+        """
+        if facing == "north":
+            # Low y = near north wall = near entrance
+            score = self.model.NewIntVar(-plot_height, plot_height, "pkg_ent_score")
+            self.model.Add(score == plot_height - vars["y"])
+            return score
+        elif facing == "south":
+            score = self.model.NewIntVar(-plot_height, plot_height, "pkg_ent_score")
+            self.model.Add(score == vars["y"])
+            return score
+        elif facing == "east":
+            score = self.model.NewIntVar(-plot_width, plot_width, "pkg_ent_score")
+            self.model.Add(score == vars["x"])
+            return score
+        else:  # west
+            score = self.model.NewIntVar(-plot_width, plot_width, "pkg_ent_score")
+            self.model.Add(score == plot_width - vars["x"])
+            return score
 
     def _add_simplified_vastu_objectives(
         self,
@@ -412,24 +888,32 @@ class VastuConstraintSolver:
                 self.model.Add(room_score == vars["x"] + vars["y"])
 
             elif "living" in room_type:
-                # Living room prefers north/northeast: low y, prefer high x
-                self.model.Add(room_score == vars["x"] - vars["y"])
+                # Living room must be near the entrance side (receives the main door)
+                ent_score = self._parking_entrance_score(
+                    vars, facing, plot_width, plot_height
+                )
+                self.model.Add(room_score == ent_score)
 
             elif "master" in room_type or "bedroom" in room_type:
                 # Bedrooms prefer south/southwest: high y
                 self.model.Add(room_score == vars["y"])
 
             elif "bathroom" in room_type or "toilet" in room_type:
-                # Bathrooms prefer northwest: low x + low y (inverted = high score for low values)
-                self.model.Add(room_score == plot_width - vars["x"])
+                # Bathrooms should be near bedrooms (which prefer south = high y).
+                # Reward bathrooms that are also in the south half of the plot,
+                # and reward low x (away from kitchen which is southeast).
+                self.model.Add(room_score == vars["y"] + (plot_width - vars["x"]))
 
             elif "puja" in room_type or "prayer" in room_type:
                 # Puja room prefers northeast: high x, low y
                 self.model.Add(room_score == vars["x"] - vars["y"])
 
             elif "parking" in room_type or "garage" in room_type:
-                # Parking prefers northwest: low x
-                self.model.Add(room_score == plot_width - vars["x"])
+                # Parking must be near the entrance side of the plot
+                entrance_score = self._parking_entrance_score(
+                    vars, facing, plot_width, plot_height
+                )
+                self.model.Add(room_score == entrance_score)
 
             elif "dining" in room_type:
                 # Dining prefers west: low x
@@ -648,57 +1132,20 @@ class VastuConstraintSolver:
             return (0, pl * 0.45)
 
     def _generate_doors(self, rooms: list[Room], request: FloorPlanRequest) -> list[Door]:
-        """
-        Generate doors between adjacent rooms and at the main entrance.
-
-        Door placement rules:
-        1. Main entrance door on the facing wall
-        2. Internal doors between adjacent rooms
-        3. Bathroom doors from connected bedroom/corridor
-        4. Kitchen door from dining/living area
-        """
-        doors = []
-        door_id = 0
-
-        # Main entrance door
+        """Generate only the main entrance door on the plot boundary wall."""
         entrance_pos = self._get_entrance_position(request)
-        facing = request.facing_direction
-        orientation = "horizontal" if facing in ["north", "south"] else "vertical"
+        facing       = request.facing_direction
+        orientation  = "horizontal" if facing in ["north", "south"] else "vertical"
 
-        doors.append(Door(
-            id=f"door_{door_id}",
+        return [Door(
+            id="main_entrance",
             x=entrance_pos[0],
             y=entrance_pos[1],
             width=3.5,
             orientation=orientation,
-            connects=["exterior", "living_room"],
-            is_main_entrance=True
-        ))
-        door_id += 1
-
-        # Find adjacent rooms and add doors between them
-        for i, room1 in enumerate(rooms):
-            for room2 in rooms[i + 1:]:
-                # Skip OTS - it doesn't need doors
-                if room1.room_type == "ots" or room2.room_type == "ots":
-                    continue
-
-                # Check if rooms share a wall
-                door_pos = self._find_shared_wall(room1, room2)
-                if door_pos:
-                    x, y, orient = door_pos
-                    doors.append(Door(
-                        id=f"door_{door_id}",
-                        x=x,
-                        y=y,
-                        width=3.0,
-                        orientation=orient,
-                        connects=[room1.id, room2.id],
-                        is_main_entrance=False
-                    ))
-                    door_id += 1
-
-        return doors
+            connects=["exterior"],
+            is_main_entrance=True,
+        )]
 
     def _find_shared_wall(self, room1: Room, room2: Room) -> tuple[float, float, str] | None:
         """

@@ -205,8 +205,12 @@ class GeneratedPlan(BaseModel):
     plan_id: str = Field(..., description="Unique plan identifier")
     layout: Layout = Field(..., description="Room layout data")
     vastu_score: VastuScore = Field(..., description="Vastu compliance scores")
-    image_base64: str = Field(..., description="Base64 encoded floor plan image")
+    image_base64: str = Field(..., description="Base64 encoded architectural floor plan image")
     image_format: str = Field(default="png", description="Image format")
+    design_suggestions: list[str] = Field(
+        default_factory=list,
+        description="Architectural design improvement suggestions"
+    )
 
 
 class FloorPlanResponse(BaseModel):

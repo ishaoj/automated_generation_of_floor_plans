@@ -1,0 +1,52 @@
+model:
+  in_channels: 3             # RGB semantic layout
+  out_channels: 3            # RGB realistic floor plan
+  image_size: 256
+  use_multiscale_discriminator: true
+  num_discriminators: 2
+  lambda_l1: 100.0
+  lambda_gan: 1.0
+
+data:
+  data_dir: "data/cubicasa5k_extracted/cubicasa5k"
+  batch_size: 8
+  num_workers: 0   # 0 = single-process loading (required on macOS — fd limit)
+  image_size: 256
+  val_split: 0.1
+  filter_non_residential: true
+  min_rooms: 2
+  max_rooms: 12
+
+training:
+  epochs: 200
+  lr_generator: 2.0e-4
+  lr_discriminator: 2.0e-4
+  beta1: 0.5
+  beta2: 0.999
+  lr_decay_start_epoch: 100  # linear decay from epoch 100 to 200
+  use_distributed: false
+
+checkpoint:
+  save_dir: "backend/models/saved/pix2pix"
+  save_every_n_epochs: 10
+  sample_every_n_batches: 500
+  keep_n_checkpoints: 3
+
+logging:
+  use_tensorboard: true
+  use_wandb: false
+  wandb_project: "vastu-ai-pix2pix"
+  log_every_n_batches: 100
+
+hardware:
+  device: "auto"             # auto: cuda > mps > cpu
+  mixed_precision: true
+
+augmentation:
+  flip_horizontal_p: 0.5
+  flip_vertical_p: 0.0
+  color_jitter: false
+
+early_stopping:
+  enabled: false
+  patience: 20

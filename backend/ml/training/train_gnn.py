@@ -33,6 +33,30 @@ from ml.training.losses import LayoutRefinementLoss, VastuAwareLoss
 from ml.training.metrics import LayoutMetrics
 
 
+def _add_solver_noise(
+    positions: torch.Tensor,
+    pos_std: float = 0.08,
+    size_std: float = 0.04,
+) -> torch.Tensor:
+    """
+    Add noise to clean CubiCasa5k positions to simulate constraint-solver
+    imprecision. The GNN is trained to recover the clean target from this
+    noisy input (denoising objective).
+
+    pos_std  — std of position jitter as fraction of plot dimension (~8%)
+    size_std — std of size jitter (~4%)
+    """
+    noisy = positions.clone()
+    device = positions.device
+
+    pos_noise  = torch.randn(positions.shape[0], 2, device=device) * pos_std
+    size_noise = torch.randn(positions.shape[0], 2, device=device) * size_std
+
+    noisy[:, :2] = torch.clamp(positions[:, :2] + pos_noise,  0.0, 0.95)
+    noisy[:, 2:] = torch.clamp(positions[:, 2:] + size_noise, 0.05, 1.0)
+    return noisy
+
+
 class GNNTrainer:
     """Trainer for GNN layout refiner"""
 
@@ -91,18 +115,19 @@ class GNNTrainer:
             positions = batch['positions'].to(self.device)
             batch_idx = batch['batch'].to(self.device)
 
+            # Denoising training: add solver-like noise to clean CubiCasa positions,
+            # train GNN to recover the original clean target.
+            target_positions = positions
+            noisy_positions  = _add_solver_noise(positions)
+
             # Forward pass
             pred_positions = self.model(
                 node_features=node_features,
                 edge_index=edge_index,
                 edge_attr=edge_attr,
-                positions=positions,
+                positions=noisy_positions,
                 batch=batch_idx,
             )
-
-            # Compute loss
-            # Target is the original position (we're learning to stay close but refine)
-            target_positions = positions
 
             if isinstance(self.criterion, VastuAwareLoss):
                 losses = self.criterion(
@@ -163,17 +188,18 @@ class GNNTrainer:
                 positions = batch['positions'].to(self.device)
                 batch_idx = batch['batch'].to(self.device)
 
+                # Use a fixed noise level during validation for consistent metrics
+                target_positions = positions
+                noisy_positions  = _add_solver_noise(positions)
+
                 # Forward pass
                 pred_positions = self.model(
                     node_features=node_features,
                     edge_index=edge_index,
                     edge_attr=edge_attr,
-                    positions=positions,
+                    positions=noisy_positions,
                     batch=batch_idx,
                 )
-
-                # Compute loss
-                target_positions = positions
 
                 if isinstance(self.criterion, VastuAwareLoss):
                     losses = self.criterion(
@@ -426,9 +452,9 @@ def main():
     print(f"Val batches: {len(val_loader)}")
 
     # Create model
-    # node_features_dim = 11 room-type one-hot + 1 area = 12
+    # node_features_dim = 11 room-type one-hot + 1 area + 4 normalised (x,y,w,h) = 16
     model = GraphAttentionRefiner(
-        node_features_dim=12,
+        node_features_dim=16,
         edge_features_dim=4,
         hidden_dim=args.hidden_dim,
         num_gat_layers=args.num_layers,
