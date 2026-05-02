@@ -18,8 +18,16 @@ from app.core.vastu_rules import get_vastu_rules
 
 router = APIRouter()
 
-# Initialize generator
-generator = FloorPlanGenerator()
+# Lazy-loaded singleton — instantiated on first request, not at import time.
+# This prevents a torch/GNN startup error from crashing the entire app process.
+_generator: FloorPlanGenerator | None = None
+
+
+def _get_generator() -> FloorPlanGenerator:
+    global _generator
+    if _generator is None:
+        _generator = FloorPlanGenerator()
+    return _generator
 
 
 @router.post("/generate", response_model=FloorPlanResponse)
@@ -30,7 +38,7 @@ async def generate_floor_plans(request: FloorPlanRequest):
     Returns multiple variations with Vastu compliance scores.
     """
     try:
-        plans = generator.generate(request)
+        plans = _get_generator().generate(request)
         return FloorPlanResponse(
             success=True,
             message=f"Generated {len(plans)} floor plan variations",

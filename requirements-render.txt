@@ -12,7 +12,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 
 # ── Constraint solver ─────────────────────────────────────────────────────────
-ortools>=9.12.4544
+ortools>=9.7
 
 # ── Graph operations ──────────────────────────────────────────────────────────
 networkx>=3.2.0
@@ -28,13 +28,14 @@ lxml>=4.9.0
 tqdm>=4.66.0
 
 # ── ML inference (CPU) ────────────────────────────────────────────────────────
-# CPU-only torch — much smaller download (~500 MB vs 2 GB for CUDA build)
+# CPU-only torch — much smaller download than CUDA build
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.1.0+cpu
-torchvision==0.16.0+cpu
+torch==2.2.0+cpu
+torchvision==0.17.0+cpu
 
 # torch-geometric (GATConv for GNN inference)
-torch-geometric>=2.4.0
+# 2.5.x is the stable release line tested with torch 2.2
+torch-geometric==2.5.3
 
-# ── XML parsing ───────────────────────────────────────────────────────────────
+# ── Numerics ──────────────────────────────────────────────────────────────────
 scikit-learn>=1.3.0
